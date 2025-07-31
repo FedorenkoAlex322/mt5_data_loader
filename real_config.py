@@ -1,4 +1,9 @@
 # -*- coding: utf-8 -*-
+
+from dotenv import load_dotenv
+import os
+load_dotenv()
+
 """
 Конфигурация для реал-тайм торговой системы Ишимоку
 Все времена в UTC, все сообщения на украинском языке
@@ -283,86 +288,15 @@ DATA_UPDATE_CONFIG = {
     'max_pairs_per_batch': 17,            # Максимум пар в одном батче (все наши пары)
 }
 
-# ==================== OANDA API ====================
-OANDA_CONFIG = {
-    'api_key': '5a2fc020587916ce35aba157a6c4459d-29534e269b11d53c20e13ec9c6bf90ca',
-    'api_url': 'https://api-fxpractice.oanda.com',  # Demo account
-    'account_id': '101-002-31824515-001',  # Конкретный аккаунт OANDA
-    'request_timeout': 30,  # Таймаут запросов (секунды)
-    'rate_limit_delay': 0.5,  # Задержка между запросами (секунды) - уменьшено для ускорения
-    
-    # Инструменты и их параметры для торговли
-    'instruments': {
-        'EUR_USD': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'GBP_USD': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'USD_CAD': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'USD_CHF': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'NZD_USD': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'AUD_USD': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'EUR_GBP': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'EUR_JPY': {
-            'pip_size': 0.01,
-            'min_trade_size': 1
-        },
-        'GBP_CHF': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'CHF_JPY': {
-            'pip_size': 0.01,
-            'min_trade_size': 1
-        },
-        'AUD_NZD': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'EUR_AUD': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'GBP_AUD': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'USD_TRY': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'USD_ZAR': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'USD_SGD': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        },
-        'EUR_NOK': {
-            'pip_size': 0.0001,
-            'min_trade_size': 1
-        }
-    }
+# ==================== MT5 API ====================
+
+MT5_CONFIG = {
+    'login': os.getenv("NT5_LOGIN"),
+    'password': os.getenv("NT5_PASSWORD"),
+    'server': os.getenv("NT5_SERVER"),
+    'terminal_path': os.getenv("NT5_TERMINAL_PATH")
 }
+
 
 # ==================== ТОРГОВЫЕ НАСТРОЙКИ ====================
 TRADING_CONFIG = {
@@ -459,15 +393,13 @@ RISK_MANAGEMENT = {
 }
 
 # ==================== ТЕЛЕГРАМ УВЕДОМЛЕНИЯ ====================
+topics_raw = os.getenv("TELEGRAM_TOPICS")
+topics = dict(item.split(":") for item in topics_raw.split(","))
+topics = {k: int(v) for k, v in topics.items()}
 TELEGRAM_CONFIG = {
-    'bot_token': '7744677734:AAEmFirAO7r8JL06-8gBGIuFAq8I01VU2yM',
-    'chat_id': '-1002311008171',
-    'topics': {
-        'trades': 223,          # Открытие и закрытие сделок
-        'system': 1528,         # Запуск системы, ошибки
-        'analysis': 222,        # Детальные логи торговых решений (теперь только разрешенные сигналы)
-        'pending_orders': 1662, # Уведомления об отложенных ордерах (MIT)
-    },
+    'bot_token': os.getenv("TELEGRAM_TOKEN"),
+    'chat_id': os.getenv("TELEGRAM_CHAT_ID"),
+    'topics': topics,
     'retry_attempts': 3,
     'retry_delay': 5,
     # Настройки фильтрации уведомлений
@@ -480,12 +412,12 @@ TELEGRAM_CONFIG = {
 
 # ==================== БАЗА ДАННЫХ ====================
 DATABASE_CONFIG = {
-    'host': 'localhost',
-    'port': 5432,
-    'database': 'trading_system',
-    'user': 'skomax_skomax',
-    'password': 'Hezaebali2025!',
-    'timezone': 'UTC',  # Принудительно устанавливаем UTC
+    'host': os.getenv("POSTGRES_HOST"),
+    'port': os.getenv("POSTGRES_PORT"),
+    'database': os.getenv("POSTGRES_DB"),
+    'user': os.getenv("POSTGRES_USER"),
+    'password': os.getenv("POSTGRES_PASSWORD"),
+    'timezone': os.getenv("POSTGRES_TIMEZONE"),  # Принудительно устанавливаем UTC
 }
 
 # ==================== РАСЧЕТ ИНДИКАТОРОВ ====================
@@ -796,7 +728,7 @@ def get_active_config():
     return {
         'system': system_config,
         'data_update': DATA_UPDATE_CONFIG,
-        'oanda': OANDA_CONFIG,
+        'mt5' : MT5_CONFIG,
         'trading': TRADING_CONFIG,
         'risk': RISK_MANAGEMENT,
         'telegram': TELEGRAM_CONFIG,

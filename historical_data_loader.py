@@ -1,456 +1,275 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Завантажувач історичних даних для багатопарної торгової системи
-Завантажує дані з лютого 2025 року по всіх активних валютних парах та таймфреймах
+Завантажувач історичних даних з MetaTrader 5 для багатопарної торгової системи
 """
 
 import sys
 import os
 import time
 import logging
-import requests
 import psycopg2
 from psycopg2.extras import execute_values
 from datetime import datetime, timedelta, timezone
-import json
 from typing import List, Dict, Optional, Tuple
-import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import MetaTrader5 as mt5
+import threading
 
-# Імпортуємо нову конфігурацію
+# Імпортуємо конфігурацію
 from real_config import (
     get_active_config, get_all_combinations, get_enabled_pairs,
-    TIMEFRAMES, CURRENCY_PAIRS, ACTIVE_TIMEFRAMES
+    get_timeframe_by_name
 )
 
 # Налаштування періоду завантаження
-START_DATE = '2025-07-01'  # Початок завантаження
-END_DATE = '2025-07-07'    # Кінець завантаження (до сьогодні)
+START_DATE = '2025-07-01'
+END_DATE = '2025-07-07'
 
-# Налаштування завантаження
-BATCH_SIZE = 5000          # Максимум свічок за один запит до OANDA (не використовується з from+to)
-MAX_WORKERS = 5            # Кількість паралельних потоків (зменшено для стабільності)
-REQUEST_DELAY = 2          # Затримка між запитами (секунди) (збільшено для стабільності)
+MAX_WORKERS = 3
+REQUEST_DELAY = 0.5  # пауза між запитами до MT5
 
-class HistoricalDataLoader:
-    """Завантажувач історичних даних"""
-    
+
+class HistoricalDataLoaderMT5:
     def __init__(self):
         self.config = get_active_config()
-        self.setup_logging()
-        
-        self.db_connection = None
+        self.logger = self.setup_logging()
         self.combinations = get_all_combinations()
-        self.stats = {
-            'total_combinations': len(self.combinations),
-            'completed': 0,
-            'total_candles_loaded': 0,
-            'total_candles_skipped': 0,
-            'errors': 0
+        self.db_connection = None
+        self.mt5_initialized = False
+        self.mt5_lock = threading.Lock()
+
+        self._initialize_mt5()  # Инициализируем MT5 перед вызовом symbols_get
+        self.symbol_mapping = self._create_symbol_mapping()
+        self.timeframe_mapping = {
+            'M5': mt5.TIMEFRAME_M5,
+            'M15': mt5.TIMEFRAME_M15,
+            'M30': mt5.TIMEFRAME_M30,
+            'H1': mt5.TIMEFRAME_H1,
+            'H4': mt5.TIMEFRAME_H4,
+            'D1': mt5.TIMEFRAME_D1
         }
-        
-        # OANDA API налаштування
-        self.oanda_session = requests.Session()
-        self.oanda_session.headers.update({
-            'Authorization': f"Bearer {self.config['oanda']['api_key']}",
-            'Content-Type': 'application/json'
-        })
-        
-        self.logger.info("🚀 Ініціалізація завантажувача історичних даних")
-        self.logger.info(f"📅 Період: {START_DATE} - {END_DATE}")
+
+        self.logger.info(f"📅 Період: {START_DATE} → {END_DATE}")
         self.logger.info(f"🔢 Комбінацій: {len(self.combinations)}")
-    
+
+
     def setup_logging(self):
-        """Налаштування логування"""
-        # Створюємо логгер
-        self.logger = logging.getLogger('HistoricalDataLoader')
-        self.logger.setLevel(logging.INFO)
-        
-        # Форматтер
+        logger = logging.getLogger('HistoricalMT5Loader')
+        logger.setLevel(logging.INFO)
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        
-        # File handler
-        file_handler = logging.FileHandler('historical_data_loader.log', encoding='utf-8')
-        file_handler.setFormatter(formatter)
-        self.logger.addHandler(file_handler)
-        
-        # Console handler
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        self.logger.addHandler(console_handler)
-    
-    def connect_to_database(self):
-        """Підключення до бази даних"""
+
+        fh = logging.FileHandler('historical_mt5_loader.log', encoding='utf-8')
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+
+        return logger
+
+    def _initialize_mt5(self):
+        with self.mt5_lock:
+            if self.mt5_initialized:
+                return True
+            mt5_config = self.config.get('mt5', {})
+            if not mt5.initialize(path=mt5_config.get('terminal_path')):
+                self.logger.error(f"❌ Не вдалося ініціалізувати MT5: {mt5.last_error()}")
+                return False
+            self.mt5_initialized = True
+            self.logger.info("✅ MT5 ініціалізовано")
+            return True
+
+    def _create_symbol_mapping(self) -> Dict[str, str]:
+        base_mapping = {
+            'EUR_USD': 'EURUSD', 'GBP_USD': 'GBPUSD', 'USD_JPY': 'USDJPY',
+            'USD_CHF': 'USDCHF', 'USD_CAD': 'USDCAD', 'AUD_USD': 'AUDUSD',
+            'NZD_USD': 'NZDUSD', 'EUR_GBP': 'EURGBP', 'EUR_JPY': 'EURJPY',
+            'EUR_CHF': 'EURCHF', 'EUR_CAD': 'EURCAD', 'EUR_AUD': 'EURAUD',
+            'EUR_NZD': 'EURNZD', 'GBP_JPY': 'GBPJPY', 'GBP_CHF': 'GBPCHF',
+            'GBP_CAD': 'GBPCAD', 'GBP_AUD': 'GBPAUD', 'GBP_NZD': 'GBPNZD',
+            'CHF_JPY': 'CHFJPY', 'CAD_JPY': 'CADJPY', 'AUD_JPY': 'AUDJPY',
+            'AUD_CAD': 'AUDCAD', 'AUD_CHF': 'AUDCHF', 'AUD_NZD': 'AUDNZD',
+            'NZD_JPY': 'NZDJPY', 'NZD_CAD': 'NZDCAD', 'NZD_CHF': 'NZDCHF',
+            'CAD_CHF': 'CADCHF'
+        }
+
+        available_symbols = [s.name for s in mt5.symbols_get()]
+        mapping = {}
+        for oanda_sym, mt5_base in base_mapping.items():
+            matches = [s for s in available_symbols if s.startswith(mt5_base)]
+            mapping[oanda_sym] = matches[0] if matches else mt5_base
+        return mapping
+
+    def connect_to_database(self) -> bool:
         try:
-            db_config = self.config['database']
+            db = self.config['database']
             self.db_connection = psycopg2.connect(
-                host=db_config['host'],
-                port=db_config['port'],
-                database=db_config['database'],
-                user=db_config['user'],
-                password=db_config['password']
+                host=db['host'],
+                port=db['port'],
+                database=db['database'],
+                user=db['user'],
+                password=db['password']
             )
             self.db_connection.autocommit = False
-            
-            # Встановлюємо UTC
             cursor = self.db_connection.cursor()
             cursor.execute("SET timezone = 'UTC'")
             cursor.close()
-            
-            self.logger.info("✅ Підключення до бази даних встановлено")
+            self.logger.info("✅ Підключено до бази даних")
             return True
-            
         except Exception as e:
             self.logger.error(f"❌ Помилка підключення до БД: {e}")
             return False
-    
-    def check_existing_data(self, combination: Dict, start_date: str, end_date: str) -> Tuple[int, datetime, datetime]:
-        """Перевіряє існуючі дані і визначає що потрібно завантажити"""
+
+    def fetch_mt5_data(self, combination: Dict, start_dt: datetime, end_dt: datetime) -> List[Dict]:
         try:
-            cursor = self.db_connection.cursor()
-            
-            # Перевіряємо кількість існуючих записів
-            count_query = """
-                SELECT COUNT(*), MIN(timestamp), MAX(timestamp)
-                FROM market_data.candles
-                WHERE symbol_id = %s AND timeframe_id = %s
-                AND timestamp >= %s AND timestamp <= %s
-            """
-            
-            cursor.execute(count_query, (
-                combination['symbol_id'],
-                combination['timeframe_id'],
-                start_date,
-                end_date
-            ))
-            
-            result = cursor.fetchone()
-            cursor.close()
-            
-            existing_count = result[0] if result[0] else 0
-            min_time = result[1] if result[1] else None
-            max_time = result[2] if result[2] else None
-            
-            return existing_count, min_time, max_time
-            
-        except Exception as e:
-            self.logger.error(f"❌ Помилка перевірки існуючих даних: {e}")
-            return 0, None, None
-    
-    def fetch_oanda_data(self, combination: Dict, start_time: str, end_time: str) -> List[Dict]:
-        """Завантаження даних з OANDA API"""
-        try:
-            # Використовуємо from + to БЕЗ count (правильний формат для OANDA API)
-            params = {
-                'granularity': combination['oanda_format'],
-                'from': start_time,
-                'to': end_time
-            }
-            
-            url = f"{self.config['oanda']['api_url']}/v3/instruments/{combination['symbol']}/candles"
-            
-            self.logger.debug(f"📥 {combination['symbol']} {combination['timeframe']}: запит {start_time} → {end_time}")
-            
-            response = self.oanda_session.get(url, params=params, timeout=30)
-            
-            # Додаємо затримку
-            time.sleep(REQUEST_DELAY)
-            
-            if response.status_code == 200:
-                data = response.json()
-                candles = data.get('candles', [])
-                
-                # Фільтруємо тільки завершені свічки
-                complete_candles = [c for c in candles if c.get('complete', True)]
-                
-                self.logger.debug(f"📊 {combination['symbol']} {combination['timeframe']}: отримано {len(complete_candles)} свічок")
-                
-                return complete_candles
-            else:
-                # Детальне логування помилки
-                try:
-                    error_data = response.json()
-                    self.logger.error(f"❌ OANDA API помилка {response.status_code} для {combination['symbol']} {combination['timeframe']}: {error_data}")
-                except:
-                    self.logger.error(f"❌ OANDA API помилка {response.status_code} для {combination['symbol']} {combination['timeframe']}")
+            symbol = self.symbol_mapping.get(combination['symbol'], combination['symbol'].replace('_', ''))
+            timeframe = self.timeframe_mapping.get(combination['timeframe'], mt5.TIMEFRAME_M5)
+
+            if not mt5.symbol_select(symbol, True):
+                self.logger.warning(f"⚠️ Неможливо вибрати символ {symbol}")
                 return []
-                
+
+            rates = mt5.copy_rates_range(symbol, timeframe, start_dt, end_dt)
+            time.sleep(REQUEST_DELAY)
+
+            if rates is None:
+                self.logger.warning(f"⚠️ MT5 не повернув жодної свічки для {symbol}")
+                return []
+
+            if len(rates) == 0:
+                self.logger.info(f"ℹ️ Немає свічок для {symbol} з {start_dt.date()} до {end_dt.date()}")
+                return []
+
+            return rates
         except Exception as e:
-            self.logger.error(f"❌ Помилка завантаження з OANDA: {e}")
+            self.logger.error(f"❌ Помилка завантаження MT5: {e}")
             return []
-    
-    def parse_oanda_time(self, time_str: str) -> datetime:
-        """Парсинг часу OANDA в UTC формат"""
-        try:
-            if '.' in time_str:
-                date_part, microsec_part = time_str.split('.')
-                microsec_part = microsec_part[:6].ljust(6, '0')
-                time_str = f"{date_part}.{microsec_part}Z"
-            
-            time_str = time_str.replace('Z', '+00:00')
-            return datetime.fromisoformat(time_str)
-            
-        except Exception as e:
-            self.logger.error(f"❌ Помилка парсингу часу: {time_str}, {e}")
-            raise
-    
-    def prepare_candle_data(self, candles: List[Dict], combination: Dict) -> List[tuple]:
-        """Підготовка даних свічок для вставки в БД"""
-        prepared_data = []
-        
-        for candle in candles:
+
+    def prepare_candle_data(self, rates, combination) -> List[tuple]:
+        prepared = []
+        for rate in rates:
             try:
-                timestamp = self.parse_oanda_time(candle['time'])
-                
-                mid_data = candle.get('mid', {})
-                open_price = float(mid_data.get('o', 0))
-                high_price = float(mid_data.get('h', 0))
-                low_price = float(mid_data.get('l', 0))
-                close_price = float(mid_data.get('c', 0))
-                volume = int(candle.get('volume', 0))
-                
+                timestamp = datetime.fromtimestamp(int(rate['time']), tz=timezone.utc)
                 record = (
-                    combination['symbol_id'],
-                    combination['timeframe_id'],
+                    int(combination['symbol_id']),
+                    int(combination['timeframe_id']),
                     timestamp,
-                    open_price,
-                    high_price,
-                    low_price,
-                    close_price,
-                    volume
+                    float(rate['open']),
+                    float(rate['high']),
+                    float(rate['low']),
+                    float(rate['close']),
+                    float(rate['tick_volume'])
                 )
-                
-                prepared_data.append(record)
-                
+                prepared.append(record)
             except Exception as e:
                 self.logger.error(f"❌ Помилка обробки свічки: {e}")
-                continue
-        
-        return prepared_data
-    
-    def insert_candles_to_db(self, candle_data: List[tuple]) -> int:
-        """Вставка свічок в БД з ігноруванням дублів"""
-        if not candle_data:
+        return prepared
+
+    def insert_candles_to_db(self, data: List[tuple]) -> int:
+        if not data:
             return 0
-        
         try:
             cursor = self.db_connection.cursor()
-            
-            insert_query = """
+            query = """
                 INSERT INTO market_data.candles 
                 (symbol_id, timeframe_id, timestamp, open, high, low, close, volume)
                 VALUES %s
                 ON CONFLICT (symbol_id, timeframe_id, timestamp) DO NOTHING
             """
-            
-            execute_values(cursor, insert_query, candle_data, page_size=1000)
-            
-            # Отримуємо кількість реально вставлених записів
-            inserted_count = cursor.rowcount
-            
+            execute_values(cursor, query, data, page_size=500)
+            count = cursor.rowcount
             self.db_connection.commit()
             cursor.close()
-            
-            return inserted_count
-            
+            return count
         except Exception as e:
             self.logger.error(f"❌ Помилка вставки в БД: {e}")
             self.db_connection.rollback()
             return 0
-    
-    def load_combination_data(self, combination: Dict) -> Dict:
-        """Завантаження даних для однієї комбінації пара/таймфрейм"""
-        start_time = time.time()
-        
+
+    def load_combination(self, combination: Dict) -> Dict:
         try:
-            self.logger.info(f"📥 Початок завантаження {combination['symbol']} {combination['timeframe']}")
-            
-            # Перевіряємо існуючі дані
-            existing_count, min_time, max_time = self.check_existing_data(
-                combination, START_DATE, END_DATE
-            )
-            
-            self.logger.info(f"📊 {combination['symbol']} {combination['timeframe']}: існує {existing_count} записів")
-            
-            # Розраховуємо періоди для завантаження
+            self.logger.info(f"📥 {combination['symbol']} {combination['timeframe']}")
             start_dt = datetime.fromisoformat(START_DATE).replace(tzinfo=timezone.utc)
             end_dt = datetime.fromisoformat(END_DATE).replace(tzinfo=timezone.utc)
-            
-            total_loaded = 0
-            total_skipped = 0
-            
-            # Завантажуємо блоками
-            current_start = start_dt
-            
-            while current_start < end_dt:
-                # Розраховуємо кінець блоку (максимум 7 днів для стабільності)
-                current_end = min(current_start + timedelta(days=7), end_dt)
-                
-                # Завантажуємо блок з OANDA
-                candles = self.fetch_oanda_data(
-                    combination,
-                    current_start.isoformat().replace('+00:00', 'Z'),
-                    current_end.isoformat().replace('+00:00', 'Z')
-                )
-                
-                if candles:
-                    # Підготовляємо дані
-                    prepared_data = self.prepare_candle_data(candles, combination)
-                    
-                    # Вставляємо в БД
-                    inserted_count = self.insert_candles_to_db(prepared_data)
-                    
-                    total_loaded += inserted_count
-                    total_skipped += len(prepared_data) - inserted_count
-                    
-                    self.logger.info(f"📈 {combination['symbol']} {combination['timeframe']}: {current_start.date()} - {current_end.date()}: +{inserted_count} свічок")
-                
-                # Переходимо до наступного блоку
-                current_start = current_end
-            
-            duration = time.time() - start_time
-            
-            result = {
-                'symbol': combination['symbol'],
-                'timeframe': combination['timeframe'],
-                'loaded': total_loaded,
-                'skipped': total_skipped,
-                'duration': duration,
-                'success': True
-            }
-            
-            self.logger.info(f"✅ {combination['symbol']} {combination['timeframe']}: завершено за {duration:.1f}с, +{total_loaded} свічок")
-            
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"❌ {combination['symbol']} {combination['timeframe']}: помилка - {e}")
+
+            total_inserted = 0
+            while start_dt < end_dt:
+                chunk_end = min(start_dt + timedelta(days=7), end_dt)
+                rates = self.fetch_mt5_data(combination, start_dt, chunk_end)
+                data = self.prepare_candle_data(rates, combination)
+                inserted = self.insert_candles_to_db(data)
+                total_inserted += inserted
+
+                self.logger.info(f"📈 {combination['symbol']} {combination['timeframe']}: {start_dt.date()} → {chunk_end.date()} — {inserted} свічок")
+
+                start_dt = chunk_end
+
             return {
                 'symbol': combination['symbol'],
                 'timeframe': combination['timeframe'],
-                'loaded': 0,
-                'skipped': 0,
-                'duration': time.time() - start_time,
-                'success': False,
-                'error': str(e)
+                'inserted': total_inserted,
+                'success': True
             }
-    
-    def run_parallel_loading(self):
-        """Паралельне завантаження всіх комбінацій"""
-        self.logger.info(f"🚀 Початок паралельного завантаження з {MAX_WORKERS} потоками")
-        
+        except Exception as e:
+            self.logger.error(f"❌ Помилка: {combination['symbol']} {combination['timeframe']}: {e}")
+            return {
+                'symbol': combination['symbol'],
+                'timeframe': combination['timeframe'],
+                'inserted': 0,
+                'success': False
+            }
+
+    def run_parallel(self):
+        self.logger.info(f"🚀 Початок завантаження з {MAX_WORKERS} потоками")
         results = []
-        
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # Запускаємо завдання
-            future_to_combination = {
-                executor.submit(self.load_combination_data, combination): combination
-                for combination in self.combinations
+            futures = {
+                executor.submit(self.load_combination, combo): combo
+                for combo in self.combinations
             }
-            
-            # Збираємо результати
-            for future in as_completed(future_to_combination):
-                combination = future_to_combination[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-                    
-                    self.stats['completed'] += 1
-                    if result['success']:
-                        self.stats['total_candles_loaded'] += result['loaded']
-                        self.stats['total_candles_skipped'] += result['skipped']
-                    else:
-                        self.stats['errors'] += 1
-                    
-                    # Показуємо прогрес
-                    progress = (self.stats['completed'] / self.stats['total_combinations']) * 100
-                    self.logger.info(f"📊 Прогрес: {self.stats['completed']}/{self.stats['total_combinations']} ({progress:.1f}%)")
-                    
-                except Exception as e:
-                    self.logger.error(f"❌ Помилка в потоці для {combination['symbol']} {combination['timeframe']}: {e}")
-                    self.stats['errors'] += 1
-        
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
         return results
-    
-    def print_final_report(self, results: List[Dict]):
-        """Друк фінального звіту"""
-        self.logger.info("\n" + "="*80)
-        self.logger.info("📋 ФІНАЛЬНИЙ ЗВІТ ЗАВАНТАЖЕННЯ ІСТОРИЧНИХ ДАНИХ")
-        self.logger.info("="*80)
-        
-        # Загальна статистика
-        self.logger.info(f"📅 Період: {START_DATE} - {END_DATE}")
-        self.logger.info(f"🔢 Комбінацій: {self.stats['total_combinations']}")
-        self.logger.info(f"✅ Успішно: {self.stats['completed'] - self.stats['errors']}")
-        self.logger.info(f"❌ Помилок: {self.stats['errors']}")
-        self.logger.info(f"📈 Завантажено нових свічок: {self.stats['total_candles_loaded']:,}")
-        self.logger.info(f"⏭️ Пропущено (дублі): {self.stats['total_candles_skipped']:,}")
-        
-        # Деталі по парам
-        self.logger.info("\n📊 ДЕТАЛІ ПО ПАРАМ:")
-        self.logger.info("-" * 80)
-        
-        # Групуємо по парам
-        pairs_stats = {}
-        for result in results:
-            if result['success']:
-                symbol = result['symbol']
-                if symbol not in pairs_stats:
-                    pairs_stats[symbol] = {'loaded': 0, 'skipped': 0, 'timeframes': 0}
-                
-                pairs_stats[symbol]['loaded'] += result['loaded']
-                pairs_stats[symbol]['skipped'] += result['skipped']
-                pairs_stats[symbol]['timeframes'] += 1
-        
-        for symbol, stats in pairs_stats.items():
-            self.logger.info(f"   {symbol:<8}: {stats['timeframes']} таймфреймів, +{stats['loaded']:,} свічок, ~{stats['skipped']:,} дублів")
-        
-        self.logger.info("="*80)
-        self.logger.info("🎉 Завантаження історичних даних завершено!")
+
+    def print_summary(self, results: List[Dict]):
+        total = len(results)
+        success = sum(1 for r in results if r['success'])
+        candles = sum(r['inserted'] for r in results)
+        self.logger.info("📋 Підсумок завантаження")
+        self.logger.info(f"✅ Успішно: {success}/{total}")
+        self.logger.info(f"📈 Вставлено свічок: {candles:,}")
+        self.logger.info("🎉 Завантаження завершено")
+
+    def close(self):
+        if self.db_connection:
+            self.db_connection.close()
+        if self.mt5_initialized:
+            mt5.shutdown()
+            self.logger.info("🔌 MT5 відключено")
+
 
 def main():
-    """Головна функція"""
-    try:
-        print("🚀 Завантажувач історичних даних для багатопарної системи")
-        print(f"📅 Період: {START_DATE} - {END_DATE}")
-        print(f"🔢 Таймфреймы: {', '.join(ACTIVE_TIMEFRAMES)}")
-        print(f"💱 Пари: {', '.join([p['symbol'] for p in get_enabled_pairs()])}")
-        print()
-        
-        # Підтвердження запуску
-        response = input("Продовжити завантаження? (y/N): ")
-        if response.lower() != 'y':
-            print("❌ Завантаження скасовано")
-            return
-        
-        # Створюємо завантажувач
-        loader = HistoricalDataLoader()
-        
-        # Підключаємося до БД
-        if not loader.connect_to_database():
-            print("❌ Не вдалося підключитися до бази даних")
-            return
-        
-        # Запускаємо завантаження
-        start_time = time.time()
-        results = loader.run_parallel_loading()
-        total_time = time.time() - start_time
-        
-        # Друкуємо звіт
-        loader.print_final_report(results)
-        loader.logger.info(f"⏱️ Загальний час виконання: {total_time:.1f} секунд")
-        
-        # Закриваємо з'єднання
-        if loader.db_connection:
-            loader.db_connection.close()
-        
-    except KeyboardInterrupt:
-        print("\n🛑 Завантаження перервано користувачем")
-    except Exception as e:
-        print(f"💥 Критична помилка: {e}")
-        import traceback
-        traceback.print_exc()
+    print(f"🚀 Завантаження історичних даних з MT5")
+    print(f"📅 Період: {START_DATE} → {END_DATE}")
+
+    proceed = input("Продовжити? (y/N): ")
+    if proceed.lower() != 'y':
+        print("❌ Скасовано")
+        return
+
+    loader = HistoricalDataLoaderMT5()
+    if not loader.connect_to_database():
+        return
+
+    start_time = time.time()
+    results = loader.run_parallel()
+    loader.print_summary(results)
+    loader.close()
+    print(f"⏱️ Завершено за {time.time() - start_time:.1f} секунд")
+
 
 if __name__ == "__main__":
-    main() 
+    main()
