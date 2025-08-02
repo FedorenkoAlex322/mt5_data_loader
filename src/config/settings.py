@@ -3,44 +3,63 @@ Configuration settings using Pydantic
 """
 
 import os
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 from datetime import time
-from pydantic import Field, validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
+from dotenv import load_dotenv
 
-from .constants import Timeframe, SystemStatus, NotificationType
+from .constants import Timeframe, SystemStatus, NotificationType, STANDARD_CURRENCY_PAIRS
+
+# Загружаем переменные окружения из .env файла
+env_file_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env")
+load_dotenv(env_file_path)
 
 
-class DatabaseConfig(BaseSettings):
-    """Конфигурация базы данных"""
-    host: str = Field(default="localhost", env="POSTGRES_HOST")
-    port: int = Field(default=5432, env="POSTGRES_PORT")
-    database: str = Field(default="trading_system", env="POSTGRES_DB")
-    user: str = Field(default="postgres", env="POSTGRES_USER")
-    password: Optional[str] = Field(default=None, env="POSTGRES_PASSWORD")
-    timezone: str = Field(default="UTC", env="POSTGRES_TIMEZONE")
+class CurrencyPair:
+    """Конфигурация валютной пары"""
+    def __init__(
+        self,
+        symbol: str,
+        symbol_id: int,
+        enabled: bool = True,
+        priority: int = 1,
+        pip_size: float = 0.0001,
+        min_trade_size: int = 1,
+        description: str = ""
+    ):
+        self.symbol = symbol
+        self.symbol_id = symbol_id
+        self.enabled = enabled
+        self.priority = priority
+        self.pip_size = pip_size
+        self.min_trade_size = min_trade_size
+        self.description = description
+
+
+class Settings(BaseSettings):
+    """Основные настройки приложения"""
+
+    # База данных
+    postgres_host: str = Field(default="localhost", env="POSTGRES_HOST")
+    postgres_port: int = Field(default=5432, env="POSTGRES_PORT")
+    postgres_db: str = Field(default="trading_system", env="POSTGRES_DB")
+    postgres_user: str = Field(default="postgres", env="POSTGRES_USER")
+    postgres_password: Optional[str] = Field(default=None, env="POSTGRES_PASSWORD")
+    postgres_timezone: str = Field(default="UTC", env="POSTGRES_TIMEZONE")
     
-    class Config:
-        env_file = ".env"
-
-
-class MT5Config(BaseSettings):
-    """Конфигурация MetaTrader5"""
-    login: Optional[int] = Field(default=None, env="MT5_LOGIN")
-    password: Optional[str] = Field(default=None, env="MT5_PASSWORD")
-    server: Optional[str] = Field(default=None, env="MT5_SERVER")
-    terminal_path: Optional[str] = Field(default=None, env="MT5_TERMINAL_PATH")
-    rate_limit_delay: float = Field(default=0.1, description="Задержка между запросами к MT5")
+    # MetaTrader5
+    mt5_login: Optional[int] = Field(default=None, env="MT5_LOGIN")
+    mt5_password: Optional[str] = Field(default=None, env="MT5_PASSWORD")
+    mt5_server: Optional[str] = Field(default=None, env="MT5_SERVER")
+    mt5_terminal_path: Optional[str] = Field(default=None, env="MT5_TERMINAL_PATH")
+    mt5_rate_limit_delay: float = Field(default=0.1, env="MT5_RATE_LIMIT_DELAY")
     
-    class Config:
-        env_file = ".env"
-
-
-class TelegramConfig(BaseSettings):
-    """Конфигурация Telegram уведомлений"""
-    bot_token: Optional[str] = Field(default=None, env="TELEGRAM_TOKEN")
-    chat_id: Optional[str] = Field(default=None, env="TELEGRAM_CHAT_ID")
-    topics: Dict[str, int] = Field(
+    # Telegram
+    telegram_token: Optional[str] = Field(default=None, env="TELEGRAM_TOKEN")
+    telegram_chat_id: Optional[str] = Field(default=None, env="TELEGRAM_CHAT_ID")
+    telegram_topics: Any = Field(
         default={
             "trades": 223,
             "system": 1528,
@@ -49,12 +68,45 @@ class TelegramConfig(BaseSettings):
         },
         env="TELEGRAM_TOPICS"
     )
-    retry_attempts: int = Field(default=3, description="Количество попыток отправки")
+    telegram_retry_attempts: int = Field(default=3, env="TELEGRAM_RETRY_ATTEMPTS")
     
-    @validator('topics', pre=True)
-    def parse_topics(cls, v):
+    # Обновление данных
+    update_interval: int = Field(default=60, env="UPDATE_INTERVAL")
+    candles_to_fetch: int = Field(default=1000, env="CANDLES_TO_FETCH")
+    parallel_downloads: bool = Field(default=True, env="PARALLEL_DOWNLOADS")
+    max_workers: int = Field(default=3, env="MAX_WORKERS")
+    max_retries: int = Field(default=5, env="MAX_RETRIES")
+    retry_interval: int = Field(default=30, env="RETRY_INTERVAL")
+    smart_schedule_mode: bool = Field(default=False, env="SMART_SCHEDULE_MODE")
+    
+    # Логирование
+    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    log_format: str = Field(
+        default="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        env="LOG_FORMAT"
+    )
+    log_max_file_size: int = Field(default=10*1024*1024, env="LOG_MAX_FILE_SIZE")
+    log_backup_count: int = Field(default=5, env="LOG_BACKUP_COUNT")
+    
+    # Мониторинг
+    heartbeat_interval: int = Field(default=3600, env="HEARTBEAT_INTERVAL")
+    enable_metrics: bool = Field(default=True, env="ENABLE_METRICS")
+    metrics_port: int = Field(default=8000, env="METRICS_PORT")
+    
+    # Торговые часы
+    trading_start_time: str = Field(default="00:00", env="TRADING_START_TIME")
+    trading_end_time: str = Field(default="23:59", env="TRADING_END_TIME")
+    trading_timezone: str = Field(default="UTC", env="TRADING_TIMEZONE")
+
+    model_config = ConfigDict(
+        case_sensitive=False,
+        extra="ignore"
+    )
+    
+    @field_validator('telegram_topics')
+    @classmethod
+    def parse_telegram_topics(cls, v):
         if isinstance(v, str):
-            # Парсим строку вида "trades:223,system:1528"
             topics = {}
             for item in v.split(','):
                 if ':' in item:
@@ -63,153 +115,130 @@ class TelegramConfig(BaseSettings):
             return topics
         return v
     
-    class Config:
-        env_file = ".env"
-
-
-class CurrencyPair(BaseSettings):
-    """Конфигурация валютной пары"""
-    symbol: str = Field(description="Символ валютной пары (например, EUR_USD)")
-    symbol_id: int = Field(description="ID символа в базе данных")
-    enabled: bool = Field(default=True, description="Активна ли пара")
-    priority: int = Field(default=1, description="Приоритет загрузки (1 = высший)")
-    pip_size: float = Field(default=0.0001, description="Размер пипса")
-    min_trade_size: int = Field(default=1, description="Минимальный размер сделки")
-    description: str = Field(description="Описание валютной пары")
-
-
-class DataUpdateConfig(BaseSettings):
-    """Конфигурация обновления данных"""
-    update_interval: int = Field(default=60, description="Интервал обновления в секундах")
-    candles_to_fetch: int = Field(default=1000, description="Количество свечей для загрузки")
-    parallel_downloads: bool = Field(default=True, description="Параллельная загрузка")
-    max_workers: int = Field(default=3, description="Максимальное количество потоков")
-    max_retries: int = Field(default=5, description="Максимальное количество попыток")
-    retry_interval: int = Field(default=30, description="Интервал между попытками в секундах")
-    smart_schedule_mode: bool = Field(default=False, description="Умный режим расписания")
-    
-    # Расписание для умного режима
-    timeframe_schedules: Dict[str, Dict[str, Any]] = Field(
-        default={
-            "M5": {"enabled": True, "interval_minutes": 5},
-            "M15": {"enabled": True, "interval_minutes": 15},
-            "M30": {"enabled": True, "interval_minutes": 30},
-            "H1": {"enabled": True, "interval_minutes": 60},
-            "H4": {"enabled": True, "interval_minutes": 240},
-            "D1": {"enabled": True, "interval_minutes": 1440},
+    @property
+    def database(self):
+        return {
+            'host': self.postgres_host, 'port': self.postgres_port,
+            'database': self.postgres_db, 'user': self.postgres_user,
+            'password': self.postgres_password, 'timezone': self.postgres_timezone
         }
-    )
     
-    class Config:
-        env_file = ".env"
-
-
-class LoggingConfig(BaseSettings):
-    """Конфигурация логирования"""
-    level: str = Field(default="INFO", description="Уровень логирования")
-    format: str = Field(
-        default="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        description="Формат логов"
-    )
-    max_file_size: int = Field(default=10*1024*1024, description="Максимальный размер файла лога (10MB)")
-    backup_count: int = Field(default=5, description="Количество файлов бэкапа")
+    @property
+    def mt5(self):
+        return {
+            'login': self.mt5_login, 'password': self.mt5_password,
+            'server': self.mt5_server, 'terminal_path': self.mt5_terminal_path,
+            'rate_limit_delay': self.mt5_rate_limit_delay
+        }
     
-    class Config:
-        env_file = ".env"
-
-
-class MonitoringConfig(BaseSettings):
-    """Конфигурация мониторинга"""
-    heartbeat_interval: int = Field(default=3600, description="Интервал heartbeat в секундах")
-    enable_metrics: bool = Field(default=True, description="Включить метрики")
-    metrics_port: int = Field(default=8000, description="Порт для метрик")
+    @property
+    def telegram(self):
+        return {
+            'bot_token': self.telegram_token, 'chat_id': self.telegram_chat_id,
+            'topics': self.telegram_topics, 'retry_attempts': self.telegram_retry_attempts
+        }
     
-    class Config:
-        env_file = ".env"
-
-
-class TradingHoursConfig(BaseSettings):
-    """Конфигурация торговых часов"""
-    start_time: time = Field(default=time(0, 0), description="Время начала торгов (UTC)")
-    end_time: time = Field(default=time(23, 59), description="Время окончания торгов (UTC)")
-    timezone: str = Field(default="UTC", description="Часовой пояс")
+    @property
+    def data_update(self):
+        return {
+            'update_interval': self.update_interval, 'candles_to_fetch': self.candles_to_fetch,
+            'parallel_downloads': self.parallel_downloads, 'max_workers': self.max_workers,
+            'max_retries': self.max_retries, 'retry_interval': self.retry_interval,
+            'smart_schedule_mode': self.smart_schedule_mode,
+            'timeframe_schedules': {
+                "M5": {"enabled": True, "interval_minutes": 5},
+                "M15": {"enabled": True, "interval_minutes": 15},
+                "M30": {"enabled": True, "interval_minutes": 30},
+                "H1": {"enabled": True, "interval_minutes": 60},
+                "H4": {"enabled": True, "interval_minutes": 240},
+                "D1": {"enabled": True, "interval_minutes": 1440},
+            }
+        }
     
-    class Config:
-        env_file = ".env"
-
-
-class Settings(BaseSettings):
-    """Основные настройки приложения"""
+    @property
+    def logging(self):
+        return {
+            'level': self.log_level, 'format': self.log_format,
+            'max_file_size': self.log_max_file_size, 'backup_count': self.log_backup_count
+        }
     
-    # Конфигурации компонентов
-    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
-    mt5: MT5Config = Field(default_factory=MT5Config)
-    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
-    data_update: DataUpdateConfig = Field(default_factory=DataUpdateConfig)
-    logging: LoggingConfig = Field(default_factory=LoggingConfig)
-    monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
-    trading_hours: TradingHoursConfig = Field(default_factory=TradingHoursConfig)
+    @property
+    def monitoring(self):
+        return {
+            'heartbeat_interval': self.heartbeat_interval, 'enable_metrics': self.enable_metrics,
+            'metrics_port': self.metrics_port
+        }
     
-    # Валютные пары
-    currency_pairs: List[CurrencyPair] = Field(
-        default=[
-            CurrencyPair(
-                symbol="EUR_USD",
-                symbol_id=7,
-                enabled=True,
-                priority=1,
+    @property
+    def trading_hours(self):
+        from datetime import time # Import time here
+        return {
+            'start_time': time.fromisoformat(self.trading_start_time),
+            'end_time': time.fromisoformat(self.trading_end_time),
+            'timezone': self.trading_timezone
+        }
+    
+    @property
+    def currency_pairs(self) -> List[CurrencyPair]:
+        """Возвращает список торговых пар из стандартного списка"""
+        # Маппинг символов на их ID в базе данных (можно вынести в конфигурацию)
+        symbol_id_mapping = {
+            'EUR_USD': 7,
+            'GBP_USD': 6,
+            'USD_CAD': 9,
+            'USD_CHF': 10,
+            'USD_JPY': 8,
+            'AUD_USD': 11,
+            'NZD_USD': 12,
+            'EUR_GBP': 13,
+            'EUR_JPY': 14,
+            'GBP_JPY': 15,
+        }
+        
+        # Описания торговых пар
+        symbol_descriptions = {
+            'EUR_USD': "Евро / Доллар США",
+            'GBP_USD': "Фунт / Доллар США", 
+            'USD_CAD': "Доллар США / Канадский доллар",
+            'USD_CHF': "Доллар США / Швейцарский франк",
+            'USD_JPY': "Доллар США / Японская иена",
+            'AUD_USD': "Австралийский доллар / Доллар США",
+            'NZD_USD': "Новозеландский доллар / Доллар США",
+            'EUR_GBP': "Евро / Британский фунт",
+            'EUR_JPY': "Евро / Японская иена",
+            'GBP_JPY': "Британский фунт / Японская иена",
+        }
+        
+        pairs = []
+        for symbol in STANDARD_CURRENCY_PAIRS:
+            symbol_id = symbol_id_mapping.get(symbol, 0)  # 0 если ID не найден
+            description = symbol_descriptions.get(symbol, f"Торговая пара {symbol}")
+            
+            # По умолчанию включаем только основные пары
+            enabled = symbol in ['EUR_USD', 'GBP_USD', 'USD_CAD', 'USD_CHF', 'USD_JPY']
+            
+            pairs.append(CurrencyPair(
+                symbol=symbol,
+                symbol_id=symbol_id,
+                enabled=enabled,
+                priority=1 if enabled else 2,
                 pip_size=0.0001,
                 min_trade_size=1,
-                description="Евро / Доллар США"
-            ),
-            CurrencyPair(
-                symbol="GBP_USD",
-                symbol_id=6,
-                enabled=True,
-                priority=1,
-                pip_size=0.0001,
-                min_trade_size=1,
-                description="Фунт / Доллар США"
-            ),
-            CurrencyPair(
-                symbol="USD_CAD",
-                symbol_id=9,
-                enabled=True,
-                priority=1,
-                pip_size=0.0001,
-                min_trade_size=1,
-                description="Доллар США / Канадский доллар"
-            ),
-            CurrencyPair(
-                symbol="USD_CHF",
-                symbol_id=10,
-                enabled=True,
-                priority=1,
-                pip_size=0.0001,
-                min_trade_size=1,
-                description="Доллар США / Швейцарский франк"
-            ),
-        ]
-    )
+                description=description
+            ))
+        
+        return pairs
     
-    # Активные таймфреймы
-    active_timeframes: List[Timeframe] = Field(
-        default=[Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4],
-        description="Активные таймфреймы для загрузки"
-    )
+    @property
+    def active_timeframes(self) -> List[Timeframe]:
+        return [Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4]
     
-    # Торговый таймфрейм
-    trading_timeframe: Timeframe = Field(
-        default=Timeframe.M5,
-        description="Основной торговый таймфрейм"
-    )
-    
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    @property
+    def trading_timeframe(self) -> Timeframe:
+        return Timeframe.M5
 
 
-# Singleton для настроек
+# Глобальная переменная для хранения экземпляра настроек
 _settings_instance: Optional[Settings] = None
 
 
@@ -222,7 +251,7 @@ def get_settings() -> Settings:
 
 
 def reload_settings() -> Settings:
-    """Перезагрузка настроек"""
+    """Перезагрузка настроек из файла"""
     global _settings_instance
     _settings_instance = Settings()
     return _settings_instance 

@@ -96,34 +96,65 @@ MT5_TIMEFRAME_MAPPING = {
     Timeframe.D1: 16408,  # mt5.TIMEFRAME_D1
 }
 
-# Базовый маппинг символов OANDA -> MT5
-OANDA_TO_MT5_SYMBOL_MAPPING = {
-    'EUR_USD': 'EURUSD',
-    'GBP_USD': 'GBPUSD',
-    'USD_JPY': 'USDJPY',
-    'USD_CHF': 'USDCHF',
-    'USD_CAD': 'USDCAD',
-    'AUD_USD': 'AUDUSD',
-    'NZD_USD': 'NZDUSD',
-    'EUR_GBP': 'EURGBP',
-    'EUR_JPY': 'EURJPY',
-    'EUR_CHF': 'EURCHF',
-    'EUR_CAD': 'EURCAD',
-    'EUR_AUD': 'EURAUD',
-    'EUR_NZD': 'EURNZD',
-    'GBP_JPY': 'GBPJPY',
-    'GBP_CHF': 'GBPCHF',
-    'GBP_CAD': 'GBPCAD',
-    'GBP_AUD': 'GBPAUD',
-    'GBP_NZD': 'GBPNZD',
-    'CHF_JPY': 'CHFJPY',
-    'CAD_JPY': 'CADJPY',
-    'AUD_JPY': 'AUDJPY',
-    'AUD_CAD': 'AUDCAD',
-    'AUD_CHF': 'AUDCHF',
-    'AUD_NZD': 'AUDNZD',
-    'NZD_JPY': 'NZDJPY',
-    'NZD_CAD': 'NZDCAD',
-    'NZD_CHF': 'NZDCHF',
-    'CAD_CHF': 'CADCHF'
-} 
+# Стандартные торговые пары (в формате OANDA)
+STANDARD_CURRENCY_PAIRS = [
+    'EUR_USD',
+    'GBP_USD', 
+    'USD_JPY',
+    'USD_CHF',
+    'USD_CAD',
+    'AUD_USD',
+    'NZD_USD',
+    'EUR_GBP',
+    'EUR_JPY',
+    'EUR_CHF',
+    'EUR_CAD',
+    'EUR_AUD',
+    'EUR_NZD',
+    'GBP_JPY',
+    'GBP_CHF',
+    'GBP_CAD',
+    'GBP_AUD',
+    'GBP_NZD',
+    'CHF_JPY',
+    'CAD_JPY',
+    'AUD_JPY',
+    'AUD_CAD',
+    'AUD_CHF',
+    'AUD_NZD',
+    'NZD_JPY',
+    'NZD_CAD',
+    'NZD_CHF',
+    'CAD_CHF'
+]
+
+# Функция для генерации возможных вариантов названий символа в MT5
+def generate_mt5_symbol_variants(symbol: str) -> list:
+    """
+    Генерирует возможные варианты названий символа для поиска в MT5
+    
+    Args:
+        symbol: Символ в формате OANDA (например, 'EUR_USD')
+        
+    Returns:
+        Список возможных вариантов названий для MT5
+    """
+    # Убираем подчеркивание
+    no_underscore = symbol.replace('_', '')
+    
+    # Различные варианты написания
+    variants = [
+        no_underscore,           # EURUSD
+        no_underscore.upper(),   # EURUSD
+        no_underscore.lower(),   # eurusd
+        symbol.replace('_', ''), # EURUSD
+        symbol.replace('_', '.'), # EUR.USD
+        symbol.replace('_', '').lower() + '.sml',  # eurusd.sml
+        symbol.replace('_', '').upper() + '.sml',  # EURUSD.sml
+        symbol.replace('_', '').lower() + '.raw',  # eurusd.raw
+        symbol.replace('_', '').upper() + '.raw',  # EURUSD.raw
+        symbol.replace('_', '').lower() + '.pro',  # eurusd.pro
+        symbol.replace('_', '').upper() + '.pro',  # EURUSD.pro
+    ]
+    
+    return list(set(variants))  # Убираем дубликаты 

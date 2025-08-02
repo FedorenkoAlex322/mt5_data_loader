@@ -26,15 +26,18 @@ def signal_handler(signum, frame):
 
 def main():
     """Основная функция"""
+    logger = None
     try:
         # Настройка обработки сигналов
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
         # Загрузка настроек
+        print("Loading settings...")
         settings = get_settings()
         
         # Настройка логирования
+        print("Setting up logging...")
         setup_logging(settings.logging)
         logger = get_logger(__name__)
         
@@ -42,13 +45,21 @@ def main():
         logger.info(f"Configuration loaded: {len(settings.currency_pairs)} pairs, {len(settings.active_timeframes)} timeframes")
         
         # Создание и запуск обновлятеля данных
+        print("Initializing data updater...")
         updater = RealTimeDataUpdater(settings)
+        print("Starting data updater...")
         updater.run()
         
     except KeyboardInterrupt:
-        logger.info("Shutdown requested by user")
+        if logger:
+            logger.info("Shutdown requested by user")
+        else:
+            print("Shutdown requested by user")
     except Exception as e:
-        logger.error("Critical error", error=str(e))
+        if logger:
+            logger.error("Critical error", error=str(e))
+        else:
+            print(f"Critical error: {e}")
         sys.exit(1)
 
 

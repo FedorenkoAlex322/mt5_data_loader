@@ -2,14 +2,11 @@
 Telegram notification system
 """
 
-import time
-from typing import Optional, Dict, Any
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import time
+from typing import Dict, Any, Optional
+from urllib.parse import urljoin
 
-from ..config.settings import TelegramConfig
-from ..config.constants import NotificationType
 from ..utils.logging import get_logger
 
 
@@ -19,154 +16,147 @@ class TelegramNotificationError(Exception):
 
 
 class TelegramNotifier:
-    """Класс для отправки уведомлений в Telegram"""
+    """Отправка уведомлений в Telegram"""
     
-    def __init__(self, config: TelegramConfig):
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Инициализация Telegram уведомлений
+        
+        Args:
+            config: Словарь с конфигурацией Telegram
+        """
         self.config = config
         self.logger = get_logger(__name__)
+        self.base_url = "https://api.telegram.org/bot{}/".format(config.get('bot_token', ''))
+        self.chat_id = config.get('chat_id')
+        self.topics = config.get('topics', {})
+        self.retry_attempts = config.get('retry_attempts', 3)
         self.session = self._create_session()
     
     def _create_session(self) -> requests.Session:
         """Создание HTTP сессии с retry логикой"""
         session = requests.Session()
-        
-        # Настройка retry стратегии
-        retry_strategy = Retry(
-            total=self.config.retry_attempts,
-            status_forcelist=[429, 500, 502, 503, 504],
-            method_whitelist=["HEAD", "GET", "POST"],
-            backoff_factor=1
-        )
-        
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        
+        session.headers.update({
+            'Content-Type': 'application/json',
+            'User-Agent': 'TradingSystem/1.0'
+        })
         return session
     
-    def send_message(
-        self, 
-        message: str, 
-        topic_type: str = "system",
-        parse_mode: str = "HTML"
-    ) -> bool:
+    def send_message(self, message: str, topic: str = "system") -> bool:
         """
-        Отправить сообщение в Telegram
+        Отправка сообщения в Telegram
         
         Args:
             message: Текст сообщения
-            topic_type: Тип топика (system, trades, analysis, etc.)
-            parse_mode: Режим парсинга (HTML, Markdown)
+            topic: Тема сообщения (system, trades, analysis, etc.)
             
         Returns:
             True если сообщение отправлено успешно
         """
+        if not self.config.get('bot_token') or not self.chat_id:
+            self.logger.warning("Telegram not configured, skipping message")
+            return False
+        
         try:
-            topic_id = self.config.topics.get(topic_type, self.config.topics.get("system", None))
+            # Определяем thread_id для топика
+            thread_id = self.topics.get(topic, None)
             
-            url = f"https://api.telegram.org/bot{self.config.bot_token}/sendMessage"
-            
-            data = {
-                'chat_id': self.config.chat_id,
+            # Параметры запроса
+            params = {
+                'chat_id': self.chat_id,
                 'text': message,
-                'parse_mode': parse_mode
+                'parse_mode': 'HTML'
             }
             
-            if topic_id:
-                data['message_thread_id'] = topic_id
+            if thread_id:
+                params['message_thread_id'] = thread_id
             
-            self.logger.debug(
-                "Sending Telegram message",
-                topic_type=topic_type,
-                topic_id=topic_id,
-                message_length=len(message)
-            )
-            
-            response = self.session.post(url, json=data, timeout=10)
-            
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('ok'):
-                    self.logger.debug("Telegram message sent successfully")
-                    return True
-                else:
-                    error_msg = result.get('description', 'Unknown error')
-                    self.logger.error(
-                        "Telegram API error",
-                        error=error_msg,
-                        status_code=response.status_code
+            # Отправка с retry логикой
+            for attempt in range(self.retry_attempts):
+                try:
+                    response = self.session.post(
+                        urljoin(self.base_url, "sendMessage"),
+                        json=params,
+                        timeout=10
                     )
-                    return False
-            else:
-                self.logger.error(
-                    "Failed to send Telegram message",
-                    status_code=response.status_code,
-                    response_text=response.text
-                )
-                return False
-                
-        except requests.exceptions.RequestException as e:
-            self.logger.error("Network error sending Telegram message", error=str(e))
-            return False
+                    response.raise_for_status()
+                    
+                    self.logger.debug(
+                        "Message sent successfully",
+                        topic=topic,
+                        message_length=len(message)
+                    )
+                    return True
+                    
+                except requests.exceptions.RequestException as e:
+                    if attempt < self.retry_attempts - 1:
+                        self.logger.warning(
+                            f"Failed to send message (attempt {attempt + 1}/{self.retry_attempts})",
+                            error=str(e)
+                        )
+                        time.sleep(2 ** attempt)  # Экспоненциальная задержка
+                    else:
+                        raise
+            
         except Exception as e:
-            self.logger.error("Unexpected error sending Telegram message", error=str(e))
-            return False
+            self.logger.error(
+                "Failed to send Telegram message",
+                topic=topic,
+                error=str(e)
+            )
+            raise TelegramNotificationError(f"Failed to send message: {e}")
     
     def send_system_start(self, system_info: Dict[str, Any]) -> bool:
-        """Отправить уведомление о запуске системы"""
+        """Отправка уведомления о запуске системы"""
         message = (
             f"🚀 <b>Система запущена</b>\n"
             f"🕐 {system_info.get('start_time', 'N/A')}\n"
-            f"💱 Валютные пары: {system_info.get('pairs', 'N/A')}\n"
+            f"💱 Пар: {system_info.get('pairs', 'N/A')}\n"
             f"📊 Таймфреймы: {system_info.get('timeframes', 'N/A')}\n"
             f"🔢 Комбинаций: {system_info.get('combinations_count', 'N/A')}\n"
-            f"⏱️ Режим: {system_info.get('mode', 'N/A')}"
+            f"⚡ Режим: {system_info.get('mode', 'N/A')}"
         )
-        
         return self.send_message(message, "system")
     
     def send_system_stop(self, system_info: Dict[str, Any]) -> bool:
-        """Отправить уведомление об остановке системы"""
+        """Отправка уведомления об остановке системы"""
         message = (
             f"🛑 <b>Система остановлена</b>\n"
             f"🕐 {system_info.get('stop_time', 'N/A')}\n"
-            f"⏰ Время работы: {system_info.get('uptime', 'N/A')}\n"
+            f"⏱️ Время работы: {system_info.get('uptime', 'N/A')}\n"
             f"🔄 Циклов: {system_info.get('cycles', 'N/A')}\n"
             f"✅ Успешных: {system_info.get('successful_cycles', 'N/A')}\n"
-            f"💾 Загружено свечей: {system_info.get('candles_count', 'N/A')}\n"
+            f"💾 Свечей: {system_info.get('candles_count', 'N/A')}\n"
             f"❌ Ошибок: {system_info.get('errors_count', 'N/A')}"
         )
-        
         return self.send_message(message, "system")
     
     def send_error_notification(self, error_info: Dict[str, Any]) -> bool:
-        """Отправить уведомление об ошибке"""
+        """Отправка уведомления об ошибке"""
         message = (
             f"❌ <b>Ошибка системы</b>\n"
             f"🕐 {error_info.get('timestamp', 'N/A')}\n"
-            f"🔍 Тип: {error_info.get('error_type', 'N/A')}\n"
-            f"📝 Описание: {error_info.get('message', 'N/A')}\n"
-            f"📍 Компонент: {error_info.get('component', 'N/A')}"
+            f"🔧 Компонент: {error_info.get('component', 'N/A')}\n"
+            f"📝 Тип: {error_info.get('error_type', 'N/A')}\n"
+            f"💬 Сообщение: {error_info.get('message', 'N/A')}"
         )
-        
         return self.send_message(message, "system")
     
     def send_heartbeat(self, stats: Dict[str, Any]) -> bool:
-        """Отправить heartbeat с статистикой"""
+        """Отправка heartbeat уведомления"""
         message = (
             f"💓 <b>Heartbeat</b>\n"
             f"🕐 {stats.get('timestamp', 'N/A')}\n"
-            f"⏰ Время работы: {stats.get('uptime', 'N/A')}\n"
+            f"⏱️ Время работы: {stats.get('uptime', 'N/A')}\n"
             f"🔄 Циклов: {stats.get('cycles', 'N/A')}\n"
             f"✅ Успешных: {stats.get('successful_cycles', 'N/A')}\n"
             f"💾 Свечей за час: {stats.get('candles_last_hour', 'N/A')}\n"
-            f"📊 Активных пар: {stats.get('active_pairs', 'N/A')}"
+            f"💱 Активных пар: {stats.get('active_pairs', 'N/A')}"
         )
-        
         return self.send_message(message, "system")
     
     def send_update_notification(self, update_info: Dict[str, Any]) -> bool:
-        """Отправить уведомление об обновлении данных"""
+        """Отправка уведомления об обновлении данных"""
         message = (
             f"📈 <b>Обновление данных</b>\n"
             f"🕐 {update_info.get('timestamp', 'N/A')}\n"
@@ -175,60 +165,52 @@ class TelegramNotifier:
             f"✅ Успешных пар: {update_info.get('successful_pairs', 'N/A')}\n"
             f"❌ Ошибок: {update_info.get('errors', 'N/A')}"
         )
-        
         return self.send_message(message, "system")
     
     def send_trade_notification(self, trade_info: Dict[str, Any]) -> bool:
-        """Отправить уведомление о сделке"""
-        direction_emoji = "📈" if trade_info.get('direction') == 'BUY' else "📉"
-        
+        """Отправка уведомления о сделке"""
         message = (
-            f"{direction_emoji} <b>Сделка {trade_info.get('direction', 'N/A')}</b>\n"
+            f"💰 <b>Сделка {trade_info.get('action', 'N/A')}</b>\n"
             f"💱 {trade_info.get('symbol', 'N/A')}\n"
-            f"💰 Объем: {trade_info.get('volume', 'N/A')}\n"
+            f"📊 Объем: {trade_info.get('volume', 'N/A')}\n"
             f"💵 Цена: {trade_info.get('price', 'N/A')}\n"
-            f"📊 Таймфрейм: {trade_info.get('timeframe', 'N/A')}\n"
-            f"🕐 Время: {trade_info.get('timestamp', 'N/A')}"
+            f"📈 Прибыль: {trade_info.get('profit', 'N/A')}\n"
+            f"🕐 {trade_info.get('timestamp', 'N/A')}"
         )
-        
         return self.send_message(message, "trades")
     
     def send_analysis_notification(self, analysis_info: Dict[str, Any]) -> bool:
-        """Отправить уведомление об анализе"""
+        """Отправка уведомления об анализе"""
         message = (
             f"📊 <b>Анализ рынка</b>\n"
             f"💱 {analysis_info.get('symbol', 'N/A')}\n"
             f"📈 Сигнал: {analysis_info.get('signal', 'N/A')}\n"
-            f"📊 Таймфрейм: {analysis_info.get('timeframe', 'N/A')}\n"
-            f"🎯 Уверенность: {analysis_info.get('confidence', 'N/A')}%\n"
-            f"📝 Комментарий: {analysis_info.get('comment', 'N/A')}\n"
-            f"🕐 Время: {analysis_info.get('timestamp', 'N/A')}"
+            f"💪 Сила: {analysis_info.get('strength', 'N/A')}\n"
+            f"📝 Описание: {analysis_info.get('description', 'N/A')}\n"
+            f"🕐 {analysis_info.get('timestamp', 'N/A')}"
         )
-        
         return self.send_message(message, "analysis")
     
     def test_connection(self) -> bool:
-        """Тестирование подключения к Telegram API"""
+        """Тестирование подключения к Telegram"""
         try:
-            url = f"https://api.telegram.org/bot{self.config.bot_token}/getMe"
-            response = self.session.get(url, timeout=10)
+            if not self.config.get('bot_token') or not self.chat_id:
+                return False
             
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('ok'):
-                    bot_info = result.get('result', {})
-                    self.logger.info(
-                        "Telegram connection test successful",
-                        bot_name=bot_info.get('first_name'),
-                        bot_username=bot_info.get('username')
-                    )
-                    return True
-            
-            self.logger.error(
-                "Telegram connection test failed",
-                status_code=response.status_code,
-                response_text=response.text
+            response = self.session.get(
+                urljoin(self.base_url, "getMe"),
+                timeout=10
             )
+            response.raise_for_status()
+            
+            bot_info = response.json()
+            if bot_info.get('ok'):
+                self.logger.info(
+                    "Telegram connection test successful",
+                    bot_name=bot_info['result'].get('first_name', 'Unknown')
+                )
+                return True
+            
             return False
             
         except Exception as e:
@@ -236,10 +218,12 @@ class TelegramNotifier:
             return False
     
     def close(self) -> None:
-        """Закрыть HTTP сессию"""
-        if self.session:
+        """Закрытие HTTP сессии"""
+        try:
             self.session.close()
-            self.logger.debug("Telegram session closed")
+            self.logger.info("Telegram notifier session closed")
+        except Exception as e:
+            self.logger.error("Error closing Telegram session", error=str(e))
     
     def __enter__(self):
         return self

@@ -49,15 +49,16 @@ class CandleProcessor:
         
         for candle in candles:
             try:
+                # Явная конвертация типов для совместимости с psycopg2
                 processed_candle = ProcessedCandle(
-                    symbol_id=symbol_id,
-                    timeframe_id=candle.timeframe.id,
+                    symbol_id=int(symbol_id),
+                    timeframe_id=int(candle.timeframe.id),
                     timestamp=candle.timestamp,
-                    open=candle.open,
-                    high=candle.high,
-                    low=candle.low,
-                    close=candle.close,
-                    volume=candle.volume
+                    open=float(candle.open),
+                    high=float(candle.high),
+                    low=float(candle.low),
+                    close=float(candle.close),
+                    volume=int(candle.volume)
                 )
                 processed_candles.append(processed_candle)
                 
@@ -95,17 +96,29 @@ class CandleProcessor:
         db_tuples = []
         
         for candle in processed_candles:
-            db_tuple = (
-                candle.symbol_id,
-                candle.timeframe_id,
-                candle.timestamp,
-                candle.open,
-                candle.high,
-                candle.low,
-                candle.close,
-                candle.volume
-            )
-            db_tuples.append(db_tuple)
+            try:
+                # Явная конвертация типов для совместимости с psycopg2
+                db_tuple = (
+                    int(candle.symbol_id),
+                    int(candle.timeframe_id),
+                    candle.timestamp,
+                    float(candle.open),
+                    float(candle.high),
+                    float(candle.low),
+                    float(candle.close),
+                    int(candle.volume)
+                )
+                db_tuples.append(db_tuple)
+                
+            except Exception as e:
+                self.logger.error(
+                    "Failed to convert candle to DB tuple",
+                    symbol_id=candle.symbol_id,
+                    timeframe_id=candle.timeframe_id,
+                    timestamp=candle.timestamp,
+                    error=str(e)
+                )
+                continue
         
         return db_tuples
     

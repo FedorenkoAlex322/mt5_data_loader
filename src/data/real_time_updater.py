@@ -86,16 +86,23 @@ class RealTimeDataUpdater:
         self.status = SystemStatus.RUNNING
         
         failed_attempts = 0
-        max_retries = self.settings.data_update.max_retries
+        max_retries = self.settings.data_update['max_retries']
         last_heartbeat = get_utc_now()
-        heartbeat_interval = self.settings.monitoring.heartbeat_interval
+        heartbeat_interval = self.settings.monitoring['heartbeat_interval']
+        last_pool_status_check = get_utc_now()
+        pool_status_check_interval = 300  # Проверка статуса пула каждые 5 минут
         
         while self.running:
             try:
                 cycle_start = get_utc_now()
                 
+                # Периодическая проверка статуса пула соединений
+                if (get_utc_now() - last_pool_status_check).total_seconds() >= pool_status_check_interval:
+                    self._log_pool_status()
+                    last_pool_status_check = get_utc_now()
+                
                 # Выбор режима обновления
-                if self.settings.data_update.smart_schedule_mode:
+                if self.settings.data_update['smart_schedule_mode']:
                     success = self._smart_update_cycle()
                 else:
                     success = self._update_cycle()
@@ -124,14 +131,14 @@ class RealTimeDataUpdater:
                 
                 # Ожидание до следующего обновления
                 if success:
-                    if self.settings.data_update.smart_schedule_mode:
+                    if self.settings.data_update['smart_schedule_mode']:
                         wait_seconds = self._calculate_next_schedule_wait()
                         self.logger.info(f"Waiting {wait_seconds}s until next schedule")
                         time.sleep(wait_seconds)
                     else:
-                        time.sleep(self.settings.data_update.update_interval)
+                        time.sleep(self.settings.data_update['update_interval'])
                 else:
-                    retry_delay = self.settings.data_update.retry_interval * min(failed_attempts, 5)
+                    retry_delay = self.settings.data_update['retry_interval'] * min(failed_attempts, 5)
                     self.logger.warning(f"Waiting {retry_delay}s after error (attempt {failed_attempts}/{max_retries})")
                     time.sleep(retry_delay)
                 
@@ -141,31 +148,58 @@ class RealTimeDataUpdater:
             except Exception as e:
                 self.logger.error("Unexpected error in update cycle", error=str(e))
                 failed_attempts += 1
-                time.sleep(self.settings.data_update.retry_interval)
+                time.sleep(self.settings.data_update['retry_interval'])
         
         # Завершение работы
         self._shutdown()
     
     def _check_connections(self) -> bool:
-        """Проверка подключений"""
+        """Проверка подключений с детальной диагностикой"""
+        self.logger.info("Checking connections...")
+        
+        # Проверка подключения к БД
         try:
-            if not self.db_manager.test_connection():
+            db_status = self.db_manager.test_connection()
+            if not db_status:
                 self.logger.error("Database connection test failed")
                 return False
             
-            if not self.mt5_client.test_connection():
-                self.logger.error("MT5 connection test failed")
-                return False
-            
-            if not self.telegram.test_connection():
-                self.logger.warning("Telegram connection test failed")
-            
-            self.logger.info("All connections verified")
-            return True
+            # Получение статуса пула соединений
+            pool_status = self.db_manager.get_pool_status()
+            self.logger.info(f"Database pool status: {pool_status}")
             
         except Exception as e:
-            self.logger.error("Connection check failed", error=str(e))
+            self.logger.error("Database connection check failed", error=str(e))
             return False
+        
+        # Проверка подключения к MT5
+        try:
+            mt5_status = self.mt5_client.test_connection()
+            if not mt5_status:
+                self.logger.error("MT5 connection test failed")
+                return False
+        except Exception as e:
+            self.logger.error("MT5 connection check failed", error=str(e))
+            return False
+        
+        # Проверка Telegram (опционально)
+        try:
+            telegram_status = self.telegram.test_connection()
+            if not telegram_status:
+                self.logger.warning("Telegram connection test failed (non-critical)")
+        except Exception as e:
+            self.logger.warning("Telegram connection check failed (non-critical)", error=str(e))
+        
+        self.logger.info("All critical connections are working")
+        return True
+    
+    def _log_pool_status(self) -> None:
+        """Логирование статуса пула соединений"""
+        try:
+            pool_status = self.db_manager.get_pool_status()
+            self.logger.info(f"Database pool status: {pool_status}")
+        except Exception as e:
+            self.logger.error("Failed to get pool status", error=str(e))
     
     def _create_combinations(self) -> List[Dict[str, Any]]:
         """Создание комбинаций для обновления"""
@@ -198,7 +232,7 @@ class RealTimeDataUpdater:
             combinations = self._create_combinations()
             
             # Обновление данных
-            if self.settings.data_update.parallel_downloads:
+            if self.settings.data_update['parallel_downloads']:
                 results = self._update_parallel(combinations)
             else:
                 results = self._update_sequential(combinations)
@@ -267,10 +301,15 @@ class RealTimeDataUpdater:
         return results
     
     def _update_parallel(self, combinations: List[Dict[str, Any]]) -> List[UpdateResult]:
-        """Параллельное обновление"""
+        """Параллельное обновление с ограниченным количеством потоков"""
         results = []
         
-        with ThreadPoolExecutor(max_workers=self.settings.data_update.max_workers) as executor:
+        # Ограничиваем количество параллельных потоков для предотвращения исчерпания подключений
+        max_workers = min(self.settings.data_update['max_workers'], 3)  # Максимум 3 потока
+        
+        self.logger.info(f"Starting parallel update with {max_workers} workers for {len(combinations)} combinations")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_combination = {
                 executor.submit(self._update_single_combination, combo): combo 
                 for combo in combinations
@@ -300,14 +339,38 @@ class RealTimeDataUpdater:
         return results
     
     def _update_single_combination(self, combination: Dict[str, Any]) -> UpdateResult:
-        """Обновление одной комбинации"""
+        """Обновление одной комбинации с улучшенной обработкой ошибок БД"""
         symbol = combination['symbol']
         timeframe = combination['timeframe']
         symbol_id = combination['symbol_id']
         
         try:
-            # Получение времени последней свечи в БД
-            last_db_time = self.db_manager.get_last_candle_time(symbol_id, timeframe.id)
+            # Получение времени последней свечи в БД с повторными попытками
+            last_db_time = None
+            max_db_retries = 3
+            db_retry_delay = 0.1  # 100ms между попытками
+            
+            for attempt in range(max_db_retries):
+                try:
+                    last_db_time = self.db_manager.get_last_candle_time(symbol_id, timeframe.id)
+                    break
+                except Exception as db_error:
+                    if attempt < max_db_retries - 1:
+                        self.logger.warning(
+                            f"Database retry {attempt + 1}/{max_db_retries} for {symbol} {timeframe.value}: {db_error}"
+                        )
+                        import time
+                        time.sleep(db_retry_delay)
+                        db_retry_delay *= 2  # Экспоненциальная задержка
+                    else:
+                        self.logger.error(f"Database error for {symbol} {timeframe.value} after {max_db_retries} attempts: {db_error}")
+                        return UpdateResult(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            success=False,
+                            new_candles=0,
+                            error_message=f"Database error: {db_error}"
+                        )
             
             # Определение времени для запроса
             from_time = last_db_time if last_db_time else (get_utc_now() - timedelta(days=1))
@@ -355,10 +418,34 @@ class RealTimeDataUpdater:
                     last_candle_time=last_db_time
                 )
             
-            # Обработка и вставка в БД
+            # Обработка и вставка в БД с повторными попытками
             processed_candles = self.candle_processor.process_mt5_candles(valid_candles, symbol_id)
             db_tuples = self.candle_processor.convert_to_db_tuples(processed_candles)
-            inserted_count = self.db_manager.insert_candles_batch(db_tuples)
+            
+            inserted_count = 0
+            db_retry_delay = 0.1
+            
+            for attempt in range(max_db_retries):
+                try:
+                    inserted_count = self.db_manager.insert_candles_batch(db_tuples)
+                    break
+                except Exception as db_error:
+                    if attempt < max_db_retries - 1:
+                        self.logger.warning(
+                            f"Database insert retry {attempt + 1}/{max_db_retries} for {symbol} {timeframe.value}: {db_error}"
+                        )
+                        import time
+                        time.sleep(db_retry_delay)
+                        db_retry_delay *= 2
+                    else:
+                        self.logger.error(f"Database insert error for {symbol} {timeframe.value} after {max_db_retries} attempts: {db_error}")
+                        return UpdateResult(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            success=False,
+                            new_candles=0,
+                            error_message=f"Database insert error: {db_error}"
+                        )
             
             # Обновление статистики
             self._update_pair_stats(symbol, timeframe, inserted_count)
@@ -402,8 +489,8 @@ class RealTimeDataUpdater:
         current_time = get_utc_now()
         
         for timeframe in self.settings.active_timeframes:
-            if timeframe.name in self.settings.data_update.timeframe_schedules:
-                schedule = self.settings.data_update.timeframe_schedules[timeframe.name]
+            if timeframe.name in self.settings.data_update['timeframe_schedules']:
+                schedule = self.settings.data_update['timeframe_schedules'][timeframe.name]
                 
                 if schedule.get('enabled', True):
                     # Проверяем нужно ли обновлять этот таймфрейм сейчас
@@ -414,10 +501,10 @@ class RealTimeDataUpdater:
     
     def _should_update_timeframe_now(self, timeframe: Timeframe, current_time: datetime) -> bool:
         """Проверка нужно ли обновлять таймфрейм сейчас"""
-        if timeframe.name not in self.settings.data_update.timeframe_schedules:
+        if timeframe.name not in self.settings.data_update['timeframe_schedules']:
             return False
         
-        schedule = self.settings.data_update.timeframe_schedules[timeframe.name]
+        schedule = self.settings.data_update['timeframe_schedules'][timeframe.name]
         interval_minutes = schedule.get('interval_minutes', timeframe.minutes)
         
         # Вычисляем время до следующего обновления
@@ -544,7 +631,7 @@ class RealTimeDataUpdater:
         min_wait = float('inf')
         
         for timeframe in self.settings.active_timeframes:
-            if timeframe.name in self.settings.data_update.timeframe_schedules:
+            if timeframe.name in self.settings.data_update['timeframe_schedules']:
                 wait_seconds = calculate_seconds_until_next_timeframe(timeframe, current_time)
                 min_wait = min(min_wait, wait_seconds)
         
@@ -555,14 +642,14 @@ class RealTimeDataUpdater:
         try:
             combinations = self._create_combinations()
             symbols = list(set(c['symbol'] for c in combinations))
-            timeframes = list(set(c['timeframe'].value for c in combinations))
+            timeframes = list(set(str(c['timeframe'].value) for c in combinations))
             
             system_info = {
                 'start_time': get_utc_now().strftime('%Y-%m-%d %H:%M:%S UTC'),
                 'pairs': ', '.join(symbols[:5]) + ('...' if len(symbols) > 5 else ''),
                 'timeframes': ', '.join(timeframes),
                 'combinations_count': len(combinations),
-                'mode': 'Smart Schedule' if self.settings.data_update.smart_schedule_mode else f'Fixed {self.settings.data_update.update_interval}s'
+                'mode': 'Smart Schedule' if self.settings.data_update['smart_schedule_mode'] else f'Fixed {self.settings.data_update["update_interval"]}s'
             }
             
             self.telegram.send_system_start(system_info)
@@ -675,6 +762,9 @@ class RealTimeDataUpdater:
         self.status = SystemStatus.STOPPING
         
         try:
+            # Логирование финального статуса пула соединений
+            self._log_pool_status()
+            
             # Отправка уведомления об остановке
             uptime = get_utc_now() - self.stats['start_time']
             
@@ -692,20 +782,31 @@ class RealTimeDataUpdater:
         except Exception as e:
             self.logger.error("Failed to send shutdown notification", error=str(e))
         
-        # Закрытие соединений
-        try:
-            self.db_manager.close()
-            self.mt5_client.close()
-            self.telegram.close()
-        except Exception as e:
-            self.logger.error("Error during cleanup", error=str(e))
-        
-        self.status = SystemStatus.STOPPED
-        self.logger.info("Real-time data updater stopped")
+        finally:
+            # Закрытие соединений
+            self.close()
+            self.status = SystemStatus.STOPPED
+            self.logger.info("Real-time data updater shutdown completed")
     
     def close(self) -> None:
-        """Закрытие соединений"""
-        self._shutdown()
+        """Закрытие всех соединений"""
+        try:
+            self.logger.info("Closing all connections...")
+            
+            # Закрытие соединений в правильном порядке
+            if hasattr(self, 'telegram'):
+                self.telegram.close()
+            
+            if hasattr(self, 'mt5_client'):
+                self.mt5_client.close()
+            
+            if hasattr(self, 'db_manager'):
+                self.db_manager.close()
+            
+            self.logger.info("All connections closed")
+            
+        except Exception as e:
+            self.logger.error("Error during connection cleanup", error=str(e))
     
     def __enter__(self):
         return self

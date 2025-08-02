@@ -80,17 +80,14 @@ def test_package_imports():
 def test_basic_settings():
     """Тест базового создания настроек без валидации"""
     try:
-        from src.config.settings import Settings, DatabaseConfig, MT5Config, TelegramConfig
+        from src.config.settings import Settings
         
         # Создаем настройки с минимальными данными
-        database_config = DatabaseConfig(password="test")
-        mt5_config = MT5Config(terminal_path="test")
-        telegram_config = TelegramConfig(bot_token="test", chat_id="test")
-        
         settings = Settings(
-            database=database_config,
-            mt5=mt5_config,
-            telegram=telegram_config
+            postgres_password="test",
+            mt5_terminal_path="test",
+            telegram_token="test",
+            telegram_chat_id="test"
         )
         print(f"✅ Basic settings created: {len(settings.currency_pairs)} pairs, {len(settings.active_timeframes)} timeframes")
         return True
